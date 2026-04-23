@@ -14,6 +14,14 @@
 #include "mbedtls/ssl.h"
 #include "secrets.h"
 
+/* ── Debug ───────────────────────────────────────────────────────────────── */
+// #define DEBUG   /* décommenter pour activer les traces UART */
+#ifdef DEBUG
+#  define DBG(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#  define DBG(fmt, ...) ((void)0)
+#endif
+
 /* ── Configuration ────────────────────────────────────────────────────────── */
 #define PRIM_HOST        "prim.iledefrance-mobilites.fr"
 #define PRIM_PORT        443
@@ -50,11 +58,11 @@
 #define MAX_BUS_TIMES   2
 
 /* ── Streaming HTTP/JSON parser ──────────────────────────────────────────── */
-#define CTX_SIZE      12288u  /* fenêtre glissante pour la recherche de patterns */
-#define LOOKBACK_SIZE 8192u   /* portion conservée entre deux scans */
-#define HDR_BUF_SIZE  256u    /* tampon d'en-têtes HTTP */
-#define DISP_SCAN_MAX 512u    /* taille max utile du bloc display_informations */
-#define DEP_SCAN_MAX 8192u    /* distance max display_informations -> departure_date_time */
+#define CTX_SIZE         12288u  /* fenêtre glissante pour la recherche de patterns */
+#define LOOKBACK_SIZE     8192u  /* portion conservée entre deux scans */
+#define HDR_BUF_SIZE       256u  /* tampon d'en-têtes HTTP */
+#define DEP_TO_DISP_MAX    600u  /* distance max departure_date_time → display_informations */
+#define DISP_BLOCK_MAX     200u  /* taille du bloc display_informations à scanner */
 
 static char   g_ctx[CTX_SIZE + 4];
 static int    g_ctx_len    = 0;
@@ -201,36 +209,31 @@ static void lcd_show_departures(void) {
     lcd_printf(1, "4615 %s %s | 6133 %s %s", b1, b2, c1, c2);
 }
 
+#ifdef DEBUG
 static void uart_dump_times(const char *tag) {
-    // printf("TIMES[%s] V=", tag);
+    DBG("TIMES[%s] V=", tag);
     if (g_v_massy_n == 0) {
-        // printf("none");
+        DBG("none");
     } else {
-        for (int i = 0; i < g_v_massy_n; i++) {
-            // printf("%s%s", i ? "," : "", g_v_massy[i]);
-        }
+        for (int i = 0; i < g_v_massy_n; i++)
+            DBG("%s%s", i ? "," : "", g_v_massy[i]);
     }
-
-    // printf(" | 4615=");
+    DBG(" | 4615=");
     if (g_4615_n == 0) {
-        // printf("none");
+        DBG("none");
     } else {
-        for (int i = 0; i < g_4615_n; i++) {
-            // printf("%s%s", i ? "," : "", g_4615[i]);
-        }
+        for (int i = 0; i < g_4615_n; i++)
+            DBG("%s%s", i ? "," : "", g_4615[i]);
     }
-
-    // printf(" | 6133=");
+    DBG(" | 6133=");
     if (g_6133_n == 0) {
-        // printf("none");
+        DBG("none");
     } else {
-        for (int i = 0; i < g_6133_n; i++) {
-            // printf("%s%s", i ? "," : "", g_6133[i]);
-        }
+        for (int i = 0; i < g_6133_n; i++)
+            DBG("%s%s", i ? "," : "", g_6133[i]);
     }
-    // printf("\n");
+    DBG("\n");
 }
-
 static void uart_dump_final_compact(void) {
     const char *v1 = g_v_massy_n > 0 ? g_v_massy[0] : "--:--";
     const char *v2 = g_v_massy_n > 1 ? g_v_massy[1] : "--:--";
@@ -239,13 +242,13 @@ static void uart_dump_final_compact(void) {
     const char *b2 = g_4615_n > 1 ? g_4615[1] : "--:--";
     const char *c1 = g_6133_n > 0 ? g_6133[0] : "--:--";
     const char *c2 = g_6133_n > 1 ? g_6133[1] : "--:--";
-
-    /* Emit a very short line multiple times to survive occasional UART corruption. */
-    for (int i = 0; i < 3; i++) {
-        printf("FT|%s|%s|%s|%s|%s|%s|%s\n",
-               v1, v2, v3, b1, b2, c1, c2);
-    }
+    for (int i = 0; i < 3; i++)
+        DBG("FT|%s|%s|%s|%s|%s|%s|%s\n", v1, v2, v3, b1, b2, c1, c2);
 }
+#else
+#  define uart_dump_times(tag)      ((void)0)
+#  define uart_dump_final_compact() ((void)0)
+#endif
 
 static const char *req_err_str(req_err_t e) {
     switch (e) {
@@ -290,137 +293,6 @@ static bool ci_prefix(const char *s, const char *prefix, size_t n) {
     return true;
 }
 
-static bool parse_ndigits(const char *s, int n, int *out) {
-    int v = 0;
-    for (int i = 0; i < n; i++) {
-        if (!isdigit((unsigned char)s[i])) return false;
-        v = v * 10 + (s[i] - '0');
-    }
-    *out = v;
-    return true;
-}
-
-static bool is_leap_year(int y) {
-    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
-}
-
-static int days_in_month(int y, int m) {
-    static const int dim[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
-    if (m == 2) return dim[m - 1] + (is_leap_year(y) ? 1 : 0);
-    return dim[m - 1];
-}
-
-/* 0=Sunday..6=Saturday */
-static int day_of_week(int y, int m, int d) {
-    if (m < 3) { m += 12; y -= 1; }
-    int k = y % 100;
-    int j = y / 100;
-    int h = (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
-    return (h + 6) % 7;
-}
-
-static int last_sunday(int y, int m) {
-    int dmax = days_in_month(y, m);
-    for (int d = dmax; d >= dmax - 6; d--) {
-        if (day_of_week(y, m, d) == 0) return d;
-    }
-    return dmax;
-}
-
-/* DST Europe/Paris in UTC: starts last Sunday of March at 01:00 UTC,
-   ends last Sunday of October at 01:00 UTC. */
-static bool is_paris_dst_utc(int y, int m, int d, int h_utc) {
-    if (m < 3 || m > 10) return false;
-    if (m > 3 && m < 10) return true;
-
-    if (m == 3) {
-        int sw = last_sunday(y, 3);
-        if (d > sw) return true;
-        if (d < sw) return false;
-        return h_utc >= 1;
-    }
-
-    int sw = last_sunday(y, 10);
-    if (d < sw) return true;
-    if (d > sw) return false;
-    return h_utc < 1;
-}
-
-static void shift_date_one_day(int *y, int *m, int *d, int dir) {
-    if (dir > 0) {
-        (*d)++;
-        if (*d > days_in_month(*y, *m)) {
-            *d = 1;
-            (*m)++;
-            if (*m > 12) { *m = 1; (*y)++; }
-        }
-    } else {
-        (*d)--;
-        if (*d < 1) {
-            (*m)--;
-            if (*m < 1) { *m = 12; (*y)--; }
-            *d = days_in_month(*y, *m);
-        }
-    }
-}
-
-/* Convert ISO timestamp to Europe/Paris HH:MM.
-   Supports e.g. "2026-04-23T07:44:00.000Z" or "+02:00" offsets. */
-static bool iso_to_paris_hhmm(const char *iso, char out[6]) {
-    int y, mo, d, hh, mm;
-    if (!iso || strlen(iso) < 16) return false;
-    if (!parse_ndigits(iso + 0, 4, &y)  || iso[4] != '-' ||
-        !parse_ndigits(iso + 5, 2, &mo) || iso[7] != '-' ||
-        !parse_ndigits(iso + 8, 2, &d)  || iso[10] != 'T' ||
-        !parse_ndigits(iso + 11, 2, &hh) || iso[13] != ':' ||
-        !parse_ndigits(iso + 14, 2, &mm)) {
-        return false;
-    }
-
-    int src_offset_min = 0;
-    const char *z = strchr(iso, 'Z');
-    const char *pplus = strrchr(iso, '+');
-    const char *pminus = strrchr(iso, '-');
-    const char *tz = NULL;
-
-    if (pplus && pplus > iso + 10) tz = pplus;
-    if (pminus && pminus > iso + 10 && (!tz || pminus > tz)) tz = pminus;
-
-    if (!z && tz) {
-        int tzh, tzm;
-        if (!parse_ndigits(tz + 1, 2, &tzh)) return false;
-        if (tz[3] == ':') {
-            if (!parse_ndigits(tz + 4, 2, &tzm)) return false;
-        } else {
-            tzm = 0;
-        }
-        src_offset_min = tzh * 60 + tzm;
-        if (tz[0] == '-') src_offset_min = -src_offset_min;
-    }
-
-    int utc_min = hh * 60 + mm - src_offset_min;
-    int yu = y, mu = mo, du = d;
-    while (utc_min < 0) {
-        utc_min += 1440;
-        shift_date_one_day(&yu, &mu, &du, -1);
-    }
-    while (utc_min >= 1440) {
-        utc_min -= 1440;
-        shift_date_one_day(&yu, &mu, &du, +1);
-    }
-
-    int h_utc = utc_min / 60;
-    int paris_offset = is_paris_dst_utc(yu, mu, du, h_utc) ? 120 : 60;
-    int local_min = utc_min + paris_offset;
-    while (local_min < 0)   local_min += 1440;
-    while (local_min >= 1440) local_min -= 1440;
-
-    int lh = local_min / 60;
-    int lm = local_min % 60;
-    snprintf(out, 6, "%02d:%02d", lh, lm);
-    return true;
-}
-
 static bool extract_navitia_hhmm(const char *raw, char out[6]) {
     if (!raw || strlen(raw) < 13 || raw[8] != 'T') return false;
     if (!isdigit((unsigned char)raw[9]) || !isdigit((unsigned char)raw[10]) ||
@@ -452,10 +324,6 @@ static bool add_unique_time(char dst[][6], int *n, int max_n, const char hhmm[6]
 static void scan_ctx(bool final_scan) {
     static const char dep_key[]  = "\"departure_date_time\":\"";
     static const char disp_key[] = "\"display_informations\":{";
-    /* Distance max entre departure_date_time et display_informations (~440 octets mesuré) */
-    #define DEP_TO_DISP_MAX 600u
-    /* Taille max du bloc display_informations pour trouver label+direction (~130 octets mesuré) */
-    #define DISP_BLOCK_MAX  200u
 
     const char *const ctxend = g_ctx + g_ctx_len;
     /* En mode non-final, ne scanner que les entrées dont on a déjà 600 octets d'avance */
@@ -623,7 +491,7 @@ static void tls_cleanup(void) {
 
 static void tls_err_cb(void *arg, err_t err) {
     (void)arg;
-    // printf("TLS erreur: %d\n", (int)err);
+    DBG("TLS erreur: %d\n", (int)err);
     g_pcb       = NULL;
     g_req_err   = REQERR_TLS_CB;
     g_req_state = REQ_ERROR;
@@ -674,7 +542,7 @@ static err_t tls_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
     err_t e = altcp_write(pcb, req, (u16_t)n, TCP_WRITE_FLAG_COPY);
     if (e != ERR_OK) { g_req_err = REQERR_WRITE; g_req_state = REQ_ERROR; return ERR_OK; }
     altcp_output(pcb);
-    // printf("Requête HTTPS envoyée\n");
+    DBG("Requête HTTPS envoyée\n");
     g_req_state = REQ_RECEIVING;
     return ERR_OK;
 }
@@ -693,7 +561,7 @@ static void start_connect(const ip_addr_t *addr) {
 
     err_t e = altcp_connect(g_pcb, addr, PRIM_PORT, tls_connected_cb);
     if (e != ERR_OK) {
-        // printf("altcp_connect: %d\n", (int)e);
+        DBG("altcp_connect: %d\n", (int)e);
         altcp_close(g_pcb);
         g_pcb       = NULL;
         g_req_err   = REQERR_CONNECT;
@@ -705,8 +573,8 @@ static void start_connect(const ip_addr_t *addr) {
 
 static void dns_found_cb(const char *name, const ip_addr_t *addr, void *arg) {
     (void)name; (void)arg;
-    if (!addr) { /* printf("DNS échec\n"); */ g_req_err = REQERR_DNS_NULL; g_req_state = REQ_ERROR; return; }
-    // printf("DNS: %s\n", ip4addr_ntoa(addr));
+    if (!addr) { DBG("DNS échec\n"); g_req_err = REQERR_DNS_NULL; g_req_state = REQ_ERROR; return; }
+    DBG("DNS: %s\n", ip4addr_ntoa(addr));
     start_connect(addr);
 }
 
@@ -725,7 +593,7 @@ static void start_fetch(const char *path) {
         /* Adresse en cache — connexion directe */
         start_connect(&server_ip);
     } else if (e != ERR_INPROGRESS) {
-        // printf("dns_gethostbyname: %d\n", (int)e);
+        DBG("dns_gethostbyname: %d\n", (int)e);
         g_req_err = REQERR_DNS_CALL;
         g_req_state = REQ_ERROR;
     }
@@ -738,20 +606,20 @@ static void start_fetch(const char *path) {
 int main(void) {
     stdio_init_all();
 
-    if (cyw43_arch_init()) { /* printf("cyw43_arch_init failed\n"); */ return 1; }
+    if (cyw43_arch_init()) { DBG("cyw43_arch_init failed\n"); return 1; }
 
     lcd_init();
-    // printf("LCD init OK\n");
+    DBG("LCD init OK\n");
 
     lcd_write_line(0, "Connexion WiFi...", 17);
     lcd_write_line(1, WIFI_SSID, (int)strlen(WIFI_SSID));
 
     cyw43_arch_enable_sta_mode();
-    // printf("WiFi '%s'...\n", WIFI_SSID);
+    DBG("WiFi '%s'...\n", WIFI_SSID);
 
     if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
             CYW43_AUTH_WPA2_MIXED_PSK, 30000) != 0) {
-        // printf("WiFi ECHEC\n");
+        DBG("WiFi ECHEC\n");
         lcd_write_line(0, "WiFi ECHEC", 10);
         lcd_write_line(1, "", 0);
         while (true) {
@@ -768,7 +636,7 @@ int main(void) {
     char ip_str[16];
     strncpy(ip_str, ip4addr_ntoa(netif_ip4_addr(netif_list)), sizeof(ip_str) - 1);
     ip_str[sizeof(ip_str) - 1] = '\0';
-    // printf("WiFi OK — %s\n", ip_str);
+    DBG("WiFi OK — %s\n", ip_str);
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
     /* Force des DNS publics: certains DNS de box répondent mal au Pico/lwIP */
@@ -808,7 +676,7 @@ int main(void) {
         if (g_req_state == REQ_IDLE && (now - last_poll) >= POLL_INTERVAL_MS) {
             last_poll = now;
             g_feed_stage = FEED_V;
-            // printf("=== Requete Navitia V ===\n");
+            DBG("=== Requete Navitia V ===\n");
             cyw43_arch_lwip_begin();
             start_fetch(NAVITIA_URI_V);
             cyw43_arch_lwip_end();
@@ -823,7 +691,7 @@ int main(void) {
 
             scan_ctx(true);
             g_has_data = true;
-            // printf("V Massy: %d | 4615: %d | 6133: %d\n", g_v_massy_n, g_4615_n, g_6133_n);
+            DBG("V Massy: %d | 4615: %d | 6133: %d\n", g_v_massy_n, g_4615_n, g_6133_n);
             if (g_feed_stage == FEED_V) {
                 uart_dump_times("V_RT");
             } else if (g_feed_stage == FEED_V_THEO) {
@@ -836,27 +704,27 @@ int main(void) {
             if (g_feed_stage == FEED_V) {
                 if (g_v_massy_n < MAX_V_MASSY) {
                     g_feed_stage = FEED_V_THEO;
-                    // printf("=== Requete Navitia V THEO (complement V) ===\n");
+                    DBG("=== Requete Navitia V THEO (complement V) ===\n");
                     cyw43_arch_lwip_begin();
                     start_fetch(NAVITIA_URI_V_THEO);
                     cyw43_arch_lwip_end();
                 } else {
                     g_feed_stage = FEED_BUS;
-                    // printf("=== Requete Navitia BUS ===\n");
+                    DBG("=== Requete Navitia BUS ===\n");
                     cyw43_arch_lwip_begin();
                     start_fetch(NAVITIA_URI_BUS);
                     cyw43_arch_lwip_end();
                 }
             } else if (g_feed_stage == FEED_V_THEO) {
                 g_feed_stage = FEED_BUS;
-                // printf("=== Requete Navitia BUS ===\n");
+                DBG("=== Requete Navitia BUS ===\n");
                 cyw43_arch_lwip_begin();
                 start_fetch(NAVITIA_URI_BUS);
                 cyw43_arch_lwip_end();
             } else if (g_feed_stage == FEED_BUS &&
                        (g_4615_n < MAX_BUS_TIMES || g_6133_n < MAX_BUS_TIMES)) {
                 g_feed_stage = FEED_BUS_THEO;
-                // printf("=== Requete Navitia BUS THEO (complement bus) ===\n");
+                DBG("=== Requete Navitia BUS THEO (complement bus) ===\n");
                 cyw43_arch_lwip_begin();
                 start_fetch(NAVITIA_URI_BUS_THEO);
                 cyw43_arch_lwip_end();
@@ -869,7 +737,7 @@ int main(void) {
 
         /* Erreur — réessayer après POLL_INTERVAL_MS */
         if (g_req_state == REQ_ERROR) {
-            // printf("Erreur requête — retry dans %ds\n", POLL_INTERVAL_MS / 1000);
+            DBG("Erreur requête — retry dans %ds\n", POLL_INTERVAL_MS / 1000);
             g_req_state = REQ_IDLE;
             cyw43_arch_lwip_begin();
             tls_cleanup();
