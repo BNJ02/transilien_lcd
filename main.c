@@ -37,7 +37,16 @@
 #define NAVITIA_URI_BUS_THEO  "/marketplace/v2/navitia/stop_areas/" \
                               "stop_area%3AIDFM%3A63415/departures" \
                               "?count=40&duration=10800&data_freshness=base_schedule"
-#define POLL_INTERVAL_MS  300000u  /* intervalle normal entre deux cycles PRIM (5 min) */
+/* Polling dynamique — intervalles et budget requêtes :
+   MIN_POLL_MS  : jamais plus d'un cycle par minute (garde-fou)
+   MAX_POLL_MS  : plafond garanti < quota (pire cas 4 req/cycle) :
+                  19h actives × 3600 / 275 × 4 = 992 req/jour < 1000
+   LEAD_TIME_S  : on rafraîchit X secondes avant expiration du 1er départ affiché
+   Mode nominal : intervalle = max(premier_départ - maintenant - LEAD_TIME, MIN_POLL_MS)
+                  si trains toutes 30min → attend ~28min → ~2 req/h au lieu de 13 */
+#define MIN_POLL_MS      60000u  /* intervalle minimum (1 min) */
+#define MAX_POLL_MS     275000u  /* intervalle maximum, budget quota */
+#define LEAD_TIME_S        120   /* avance de rafraîchissement (2 min) */
 /* Horaires de service (heure Paris locale) :
    V           : 05h00 – 00h00
    Bus 4615    : 06h00 – 22h00
@@ -133,8 +142,10 @@ static char g_4615[MAX_BUS_TIMES][6];
 static int  g_4615_n = 0;
 static char g_6133[MAX_BUS_TIMES][6];
 static int  g_6133_n = 0;
-static bool    g_has_data     = false;
-static uint8_t g_current_hour = 0xFF; /* 0xFF = heure inconnue (avant 1er fetch) */
+static bool     g_has_data     = false;
+static uint8_t  g_current_hour = 0xFF; /* 0xFF = heure inconnue (avant 1er fetch) */
+static uint8_t  g_current_min  = 0xFF;
+static uint32_t g_next_poll_ms = MAX_POLL_MS; /* intervalle calculé dynamiquement */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LCD driver
@@ -312,8 +323,8 @@ static bool paris_is_cest(int m, int d) {
     return false;
 }
 
-/* Parse "Date: Thu, 24 Apr 2026 10:15:30 GMT" → met à jour g_current_hour. */
-static void update_hour_from_hdr(void) {
+/* Parse "Date: Thu, 24 Apr 2026 10:15:30 GMT" → met à jour g_current_hour/min. */
+static void update_time_from_hdr(void) {
     /* Recherche "ate: " pour capturer "Date:" et "date:" indifféremment */
     const char *p = bstrstr(g_hbuf, g_hbuf + g_hbuf_len, "ate: ");
     if (!p) return;
@@ -330,17 +341,46 @@ static void update_hour_from_hdr(void) {
     if (!month || p[6] != ' ') return;
     /* Sauter l'année "2026 " (4 chiffres + espace) */
     if (p[11] != ' ') return;
+    /* HH:MM à p[12..16] */
     if (!isdigit((unsigned char)p[12]) || !isdigit((unsigned char)p[13])) return;
+    if (p[14] != ':') return;
+    if (!isdigit((unsigned char)p[15]) || !isdigit((unsigned char)p[16])) return;
     int h_utc = (p[12]-'0')*10 + (p[13]-'0');
+    int m_utc = (p[15]-'0')*10 + (p[16]-'0');
     int offset = paris_is_cest(month, day) ? 2 : 1;
-    g_current_hour = (uint8_t)((h_utc + offset) % 24);
-    DBG("Heure Paris: %02dh (UTC%+d)\n", g_current_hour, offset);
+    int local_min_abs = (h_utc + offset) * 60 + m_utc;
+    g_current_hour = (uint8_t)((local_min_abs / 60) % 24);
+    g_current_min  = (uint8_t)(local_min_abs % 60);
+    DBG("Heure Paris: %02d:%02d (UTC%+d)\n", g_current_hour, g_current_min, offset);
+}
+
+/* Calcule g_next_poll_ms d'après le 1er départ V affiché et l'heure actuelle.
+   Objectif : rafraîchir juste avant que ce départ disparaisse de l'affichage,
+   sans jamais descendre sous MIN_POLL_MS ni dépasser MAX_POLL_MS. */
+static void compute_next_poll(void) {
+    if (g_v_massy_n == 0 || g_current_hour == 0xFF || g_current_min == 0xFF) {
+        g_next_poll_ms = MAX_POLL_MS;
+        return;
+    }
+    /* Premier départ V affiché */
+    int dep_h = (g_v_massy[0][0]-'0')*10 + (g_v_massy[0][1]-'0');
+    int dep_m = (g_v_massy[0][3]-'0')*10 + (g_v_massy[0][4]-'0');
+    int now_abs = (int)g_current_hour * 60 + (int)g_current_min;
+    int dep_abs = dep_h * 60 + dep_m;
+    if (dep_abs <= now_abs) dep_abs += 1440; /* lendemain */
+    int delta_s = (dep_abs - now_abs) * 60 - LEAD_TIME_S;
+    uint32_t next = (delta_s > 0) ? (uint32_t)delta_s * 1000u : MIN_POLL_MS;
+    if (next < MIN_POLL_MS) next = MIN_POLL_MS;
+    if (next > MAX_POLL_MS) next = MAX_POLL_MS;
+    g_next_poll_ms = next;
+    DBG("Prochain poll dans %lus (dep V=%s)\n", (unsigned long)(next/1000), g_v_massy[0]);
 }
 
 /* Retourne true si toutes les lignes sont à l'arrêt (00h00 – 04h59). */
 static bool is_night_hours(void) {
     return g_current_hour != 0xFF && g_current_hour < HOUR_SERVICE_START;
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Parseur JSON SIRI Lite
@@ -716,7 +756,7 @@ int main(void) {
     lcd_printf(1, "IP:%s", ip_str);
 
     /* Première requête immédiate */
-    uint32_t last_poll = to_ms_since_boot(get_absolute_time()) - POLL_INTERVAL_MS;
+    uint32_t last_poll = to_ms_since_boot(get_absolute_time()) - MAX_POLL_MS;
 
     while (true) {
         uint32_t now = to_ms_since_boot(get_absolute_time());
@@ -734,7 +774,7 @@ int main(void) {
         }
 
         /* Déclencher le polling périodique */
-        if (g_req_state == REQ_IDLE && (now - last_poll) >= POLL_INTERVAL_MS) {
+        if (g_req_state == REQ_IDLE && (now - last_poll) >= g_next_poll_ms) {
             last_poll = now;
             if (is_night_hours()) {
                 /* Toutes les lignes sont à l'arrêt — pas de requête */
@@ -759,7 +799,7 @@ int main(void) {
             tls_cleanup();
             cyw43_arch_lwip_end();
 
-            update_hour_from_hdr();
+            update_time_from_hdr();
             scan_ctx(true);
             g_has_data = true;
             DBG("V Massy: %d | 4615: %d | 6133: %d\n", g_v_massy_n, g_4615_n, g_6133_n);
@@ -802,14 +842,16 @@ int main(void) {
             } else {
                 uart_dump_times("FINAL_LCD");
                 uart_dump_final_compact();
+                compute_next_poll();
                 lcd_show_departures();
             }
         }
 
-        /* Erreur — réessayer après POLL_INTERVAL_MS */
+        /* Erreur — réessayer après MAX_POLL_MS */
         if (g_req_state == REQ_ERROR) {
-            DBG("Erreur requête — retry dans %ds\n", POLL_INTERVAL_MS / 1000);
-            update_hour_from_hdr(); /* peut être partiel mais tente quand même */
+            DBG("Erreur requête — retry dans %lus\n", (unsigned long)(g_next_poll_ms/1000));
+            update_time_from_hdr(); /* peut être partiel mais tente quand même */
+            g_next_poll_ms = MAX_POLL_MS;
             g_req_state = REQ_IDLE;
             cyw43_arch_lwip_begin();
             tls_cleanup();
@@ -817,7 +859,7 @@ int main(void) {
             last_poll = to_ms_since_boot(get_absolute_time());
             if (!g_has_data) {
                 lcd_write_line(0, "Erreur API PRIM", 15);
-                lcd_printf(1, "Retry %ds E:%s", POLL_INTERVAL_MS / 1000, req_err_str(g_req_err));
+                lcd_printf(1, "Retry %lus E:%s", (unsigned long)(MAX_POLL_MS/1000), req_err_str(g_req_err));
             }
         }
 
