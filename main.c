@@ -37,7 +37,14 @@
 #define NAVITIA_URI_BUS_THEO  "/marketplace/v2/navitia/stop_areas/" \
                               "stop_area%3AIDFM%3A63415/departures" \
                               "?count=40&duration=10800&data_freshness=base_schedule"
-#define POLL_INTERVAL_MS 60000u   /* intervalle entre deux requêtes PRIM */
+#define POLL_INTERVAL_MS  300000u  /* intervalle normal entre deux cycles PRIM (5 min) */
+/* Horaires de service (heure Paris locale) :
+   V           : 05h00 – 00h00
+   Bus 4615    : 06h00 – 22h00
+   Bus 6133    : 06h00 – 21h00
+   Hors service : 00h00 – 04h59 (toutes lignes arrêtées) */
+#define HOUR_SERVICE_START  5u   /* première heure où au moins une ligne roule */
+#define HOUR_SERVICE_END   24u   /* toutes lignes arrêtées à partir de cette heure (00h) */
 #define REQ_TIMEOUT_MS  30000u    /* timeout global d'une requête DNS/TLS/HTTP */
 
 /* ── GPIO LCD (Pico 2W → LCD HD44780 2×40) ───────────────────────────────── */
@@ -126,7 +133,8 @@ static char g_4615[MAX_BUS_TIMES][6];
 static int  g_4615_n = 0;
 static char g_6133[MAX_BUS_TIMES][6];
 static int  g_6133_n = 0;
-static bool g_has_data     = false;
+static bool    g_has_data     = false;
+static uint8_t g_current_hour = 0xFF; /* 0xFF = heure inconnue (avant 1er fetch) */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LCD driver
@@ -272,7 +280,7 @@ static const char *req_err_str(req_err_t e) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Parseur JSON SIRI Lite
+   Heure locale — parsée depuis l'en-tête HTTP "Date:"
    ══════════════════════════════════════════════════════════════════════════ */
 
 /* strstr borné : cherche needle dans [start, end) */
@@ -284,6 +292,59 @@ static const char *bstrstr(const char *start, const char *end, const char *needl
     }
     return NULL;
 }
+
+static int http_month_num(const char *s) {
+    static const char * const names[12] = {
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec"
+    };
+    for (int i = 0; i < 12; i++)
+        if (memcmp(s, names[i], 3) == 0) return i + 1;
+    return 0;
+}
+
+/* DST Europe/Paris : CEST (UTC+2) du dernier dimanche de mars au dernier dimanche
+   d'octobre. Approximation : transition aux alentours du 25 du mois. */
+static bool paris_is_cest(int m, int d) {
+    if (m > 3 && m < 10) return true;
+    if (m == 3)  return d >= 25;
+    if (m == 10) return d <  25;
+    return false;
+}
+
+/* Parse "Date: Thu, 24 Apr 2026 10:15:30 GMT" → met à jour g_current_hour. */
+static void update_hour_from_hdr(void) {
+    /* Recherche "ate: " pour capturer "Date:" et "date:" indifféremment */
+    const char *p = bstrstr(g_hbuf, g_hbuf + g_hbuf_len, "ate: ");
+    if (!p) return;
+    p += 5;
+    /* Sauter le nom du jour "Thu, " */
+    const char *comma = memchr(p, ',', 10);
+    if (!comma) return;
+    p = comma + 2;
+    /* Format attendu : "24 Apr 2026 10:15:30 GMT" */
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1])) return;
+    int day = (p[0]-'0')*10 + (p[1]-'0');
+    if (p[2] != ' ') return;
+    int month = http_month_num(p + 3);
+    if (!month || p[6] != ' ') return;
+    /* Sauter l'année "2026 " (4 chiffres + espace) */
+    if (p[11] != ' ') return;
+    if (!isdigit((unsigned char)p[12]) || !isdigit((unsigned char)p[13])) return;
+    int h_utc = (p[12]-'0')*10 + (p[13]-'0');
+    int offset = paris_is_cest(month, day) ? 2 : 1;
+    g_current_hour = (uint8_t)((h_utc + offset) % 24);
+    DBG("Heure Paris: %02dh (UTC%+d)\n", g_current_hour, offset);
+}
+
+/* Retourne true si toutes les lignes sont à l'arrêt (00h00 – 04h59). */
+static bool is_night_hours(void) {
+    return g_current_hour != 0xFF && g_current_hour < HOUR_SERVICE_START;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Parseur JSON SIRI Lite
+   ══════════════════════════════════════════════════════════════════════════ */
 
 static bool ci_prefix(const char *s, const char *prefix, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -675,11 +736,20 @@ int main(void) {
         /* Déclencher le polling périodique */
         if (g_req_state == REQ_IDLE && (now - last_poll) >= POLL_INTERVAL_MS) {
             last_poll = now;
-            g_feed_stage = FEED_V;
-            DBG("=== Requete Navitia V ===\n");
-            cyw43_arch_lwip_begin();
-            start_fetch(NAVITIA_URI_V);
-            cyw43_arch_lwip_end();
+            if (is_night_hours()) {
+                /* Toutes les lignes sont à l'arrêt — pas de requête */
+                DBG("Pause nuit (h=%02d) — skip\n", g_current_hour);
+                if (!g_has_data) {
+                    lcd_write_line(0, "Hors service (nuit)", 19);
+                    lcd_write_line(1, "", 0);
+                }
+            } else {
+                g_feed_stage = FEED_V;
+                DBG("=== Requete Navitia V ===\n");
+                cyw43_arch_lwip_begin();
+                start_fetch(NAVITIA_URI_V);
+                cyw43_arch_lwip_end();
+            }
         }
 
         /* Réponse reçue */
@@ -689,6 +759,7 @@ int main(void) {
             tls_cleanup();
             cyw43_arch_lwip_end();
 
+            update_hour_from_hdr();
             scan_ctx(true);
             g_has_data = true;
             DBG("V Massy: %d | 4615: %d | 6133: %d\n", g_v_massy_n, g_4615_n, g_6133_n);
@@ -738,6 +809,7 @@ int main(void) {
         /* Erreur — réessayer après POLL_INTERVAL_MS */
         if (g_req_state == REQ_ERROR) {
             DBG("Erreur requête — retry dans %ds\n", POLL_INTERVAL_MS / 1000);
+            update_hour_from_hdr(); /* peut être partiel mais tente quand même */
             g_req_state = REQ_IDLE;
             cyw43_arch_lwip_begin();
             tls_cleanup();
