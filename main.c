@@ -47,6 +47,7 @@
 #define MIN_POLL_MS      60000u  /* intervalle minimum (1 min) */
 #define MAX_POLL_MS     275000u  /* intervalle maximum, budget quota */
 #define LEAD_TIME_S        120   /* avance de rafraîchissement (2 min) */
+#define DAILY_REQ_LIMIT    960u  /* seuil disjoncteur : force MAX_POLL dès 960 req/jour */
 /* Horaires de service (heure Paris locale) :
    V           : 05h00 – 00h00
    Bus 4615    : 06h00 – 22h00
@@ -145,7 +146,9 @@ static int  g_6133_n = 0;
 static bool     g_has_data     = false;
 static uint8_t  g_current_hour = 0xFF; /* 0xFF = heure inconnue (avant 1er fetch) */
 static uint8_t  g_current_min  = 0xFF;
+static uint8_t  g_prev_hour    = 0xFF; /* pour détecter le passage à minuit */
 static uint32_t g_next_poll_ms = MAX_POLL_MS; /* intervalle calculé dynamiquement */
+static uint16_t g_daily_req_count = 0; /* compteur de requêtes HTTPS depuis minuit */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LCD driver
@@ -354,26 +357,64 @@ static void update_time_from_hdr(void) {
     DBG("Heure Paris: %02d:%02d (UTC%+d)\n", g_current_hour, g_current_min, offset);
 }
 
-/* Calcule g_next_poll_ms d'après le 1er départ V affiché et l'heure actuelle.
-   Objectif : rafraîchir juste avant que ce départ disparaisse de l'affichage,
-   sans jamais descendre sous MIN_POLL_MS ni dépasser MAX_POLL_MS. */
+/* Calcule g_next_poll_ms :
+   - Si un départ (V ou bus) est dans ≤ URGENT_MIN minutes → MIN_POLL_MS (temps réel utile)
+   - Sinon → on attend jusqu'à LEAD_TIME_S avant le prochain départ le plus proche,
+     borné entre MIN_POLL_MS et MAX_POLL_MS. */
+#define URGENT_MIN 7   /* seuil d'urgence en minutes */
 static void compute_next_poll(void) {
-    if (g_v_massy_n == 0 || g_current_hour == 0xFF || g_current_min == 0xFF) {
+    if (g_current_hour == 0xFF || g_current_min == 0xFF) {
         g_next_poll_ms = MAX_POLL_MS;
         return;
     }
-    /* Premier départ V affiché */
-    int dep_h = (g_v_massy[0][0]-'0')*10 + (g_v_massy[0][1]-'0');
-    int dep_m = (g_v_massy[0][3]-'0')*10 + (g_v_massy[0][4]-'0');
+    /* Disjoncteur quotidien : si quota approché, pas de mode urgent */
+    if (g_daily_req_count >= DAILY_REQ_LIMIT) {
+        g_next_poll_ms = MAX_POLL_MS;
+        DBG("Quota journalier atteint (%d req) -> MAX_POLL force\n", g_daily_req_count);
+        return;
+    }
     int now_abs = (int)g_current_hour * 60 + (int)g_current_min;
-    int dep_abs = dep_h * 60 + dep_m;
-    if (dep_abs <= now_abs) dep_abs += 1440; /* lendemain */
-    int delta_s = (dep_abs - now_abs) * 60 - LEAD_TIME_S;
-    uint32_t next = (delta_s > 0) ? (uint32_t)delta_s * 1000u : MIN_POLL_MS;
-    if (next < MIN_POLL_MS) next = MIN_POLL_MS;
-    if (next > MAX_POLL_MS) next = MAX_POLL_MS;
+
+    /* Collecter tous les départs affichés dans un tableau plat */
+    const char *all[MAX_V_MASSY + MAX_BUS_TIMES + MAX_BUS_TIMES];
+    int count = 0;
+    for (int i = 0; i < g_v_massy_n; i++) all[count++] = g_v_massy[i];
+    for (int i = 0; i < g_4615_n;   i++) all[count++] = g_4615[i];
+    for (int i = 0; i < g_6133_n;   i++) all[count++] = g_6133[i];
+
+    if (count == 0) { g_next_poll_ms = MAX_POLL_MS; return; }
+
+    /* Trouver le départ le plus proche */
+    int min_delta_min = 9999;
+    const char *earliest = NULL;
+    for (int i = 0; i < count; i++) {
+        int dh = (all[i][0]-'0')*10 + (all[i][1]-'0');
+        int dm = (all[i][3]-'0')*10 + (all[i][4]-'0');
+        int dep_abs = dh * 60 + dm;
+        if (dep_abs <= now_abs) dep_abs += 1440;
+        int delta_min = dep_abs - now_abs;
+        if (delta_min < min_delta_min) {
+            min_delta_min = delta_min;
+            earliest = all[i];
+        }
+    }
+
+    uint32_t next;
+    if (min_delta_min <= URGENT_MIN) {
+        /* Départ imminent : refresh rapide pour avoir le temps réel */
+        next = MIN_POLL_MS;
+        DBG("Urgence (dep=%s dans %dmin) -> poll %lus\n",
+            earliest, min_delta_min, (unsigned long)(next/1000));
+    } else {
+        /* Attendre jusqu'à LEAD_TIME_S avant le départ le plus proche */
+        int delta_s = min_delta_min * 60 - LEAD_TIME_S;
+        next = (delta_s > 0) ? (uint32_t)delta_s * 1000u : MIN_POLL_MS;
+        if (next < MIN_POLL_MS) next = MIN_POLL_MS;
+        if (next > MAX_POLL_MS) next = MAX_POLL_MS;
+        DBG("Prochain poll dans %lus (dep le plus proche=%s dans %dmin)\n",
+            (unsigned long)(next/1000), earliest, min_delta_min);
+    }
     g_next_poll_ms = next;
-    DBG("Prochain poll dans %lus (dep V=%s)\n", (unsigned long)(next/1000), g_v_massy[0]);
 }
 
 /* Retourne true si toutes les lignes sont à l'arrêt (00h00 – 04h59). */
@@ -680,6 +721,7 @@ static void dns_found_cb(const char *name, const ip_addr_t *addr, void *arg) {
 }
 
 static void start_fetch(const char *path) {
+    g_daily_req_count++;
     stream_reset();
     if (g_feed_stage == FEED_V) { g_v_massy_n = 0; }
     else if (g_feed_stage == FEED_BUS) { g_4615_n = 0; g_6133_n = 0; }
@@ -772,6 +814,14 @@ int main(void) {
             g_req_err = REQERR_TIMEOUT;
             g_req_state = REQ_ERROR;
         }
+
+        /* Reset compteur quotidien au passage de minuit */
+        if (g_current_hour != 0xFF && g_prev_hour != 0xFF &&
+            g_current_hour < g_prev_hour) {
+            DBG("Nouveau jour — reset compteur (%d req hier)\n", g_daily_req_count);
+            g_daily_req_count = 0;
+        }
+        if (g_current_hour != 0xFF) g_prev_hour = g_current_hour;
 
         /* Déclencher le polling périodique */
         if (g_req_state == REQ_IDLE && (now - last_poll) >= g_next_poll_ms) {

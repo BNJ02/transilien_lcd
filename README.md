@@ -1,8 +1,9 @@
 # transilien_lcd
 
 Panneau d'affichage temps réel des prochains départs Transilien et bus sur un écran LCD 2×40,
-piloté par un Raspberry Pi Pico 2W. Les horaires sont interrogés toutes les minutes via
-l'API PRIM d'Île-de-France Mobilités.
+piloté par un Raspberry Pi Pico 2W. Les horaires sont interrogés dynamiquement via
+l'API PRIM d'Île-de-France Mobilités, avec un intervalle de 1 à 4 min 35 s selon l'imminence
+des prochains départs, dans la limite de 1 000 requêtes/jour.
 
 ```
 ╔════════════════════════════════════════╗
@@ -27,6 +28,7 @@ l'API PRIM d'Île-de-France Mobilités.
 10. [Fichiers du projet](#10-fichiers-du-projet)
 11. [Mise en route](#11-mise-en-route)
 12. [Script de validation Python](#12-script-de-validation-python)
+13. [Gestion du quota API](#13-gestion-du-quota-api)
 
 ---
 
@@ -43,8 +45,9 @@ depuis Bièvres sans sortir son téléphone.
 | Bus 4615 | → Vélizy 2 | Mairie de Bièvres | 2 prochains |
 | Bus 6133 | → Gare de Chaville Rive Droite | Mairie de Bièvres | 2 prochains |
 
-L'afficheur est mis à jour toutes les 60 secondes. En cas d'erreur réseau, le dernier
-affichage reste visible jusqu'au prochain cycle réussi.
+L'afficheur est mis à jour avec un intervalle **dynamique** entre 60 s et 4 min 35 s,
+selon l'imminence du prochain départ. En cas d'erreur réseau, le dernier affichage
+reste visible jusqu'au prochain cycle réussi.
 
 ---
 
@@ -406,7 +409,8 @@ sequenceDiagram
     end
 
     Note over PICO: lcd_show_departures()<br/>Mise à jour LCD
-    Note over PICO: sleep 60 s → nouveau cycle
+    Note over PICO: compute_next_poll() → 60–275 s
+    Note over PICO: sleep N s → nouveau cycle
 ```
 
 **Points notables :**
@@ -432,7 +436,7 @@ graph TD
     DONE["REQ_DONE<br/>connexion fermée par serveur"]
     ERROR["REQ_ERROR"]
 
-    IDLE -->|"timer 60 s écoulé"| RESOLVING
+    IDLE -->|"timer N s écoulé (60–275 s)"| RESOLVING
     RESOLVING -->|"dns_found_cb"| CONNECTING
     RESOLVING -->|"pas de réponse / NULL"| ERROR
     CONNECTING -->|"tls_connected_cb OK"| RECEIVING
@@ -473,7 +477,7 @@ Si un créneau n'est pas disponible (données insuffisantes ou erreur), `--:--` 
 | Connexion WiFi | `Connexion WiFi...` | SSID |
 | WiFi échoué | `WiFi ECHEC` | — |
 | Chargement API | `Chargement...` | `IP:x.x.x.x` |
-| Erreur API | `Erreur API PRIM` | `Retry 60s E:<code>` |
+| Erreur API | `Erreur API PRIM` | `Retry Ns E:<code>` |
 
 ---
 
@@ -571,6 +575,42 @@ Transilien V -> Massy-Palaiseau
 Le script utilise une désérialisation JSON complète (`json.load`) — contrairement au
 parseur C par scan de chaînes — ce qui en fait une référence fiable pour détecter
 toute régression du firmware.
+
+---
+
+## 13. Gestion du quota API
+
+L'API PRIM est limitée à **1 000 requêtes par jour**. Chaque cycle peut émettre
+jusqu'à 4 requêtes HTTPS (V temps réel + V théorique + bus temps réel + bus théorique).
+
+### Intervalle dynamique (`compute_next_poll`)
+
+Après chaque cycle complet, l'intervalle avant le prochain cycle est calculé ainsi :
+
+| Situation | Intervalle | Raison |
+|---|---|---|
+| Prochain départ ≤ 7 min (toutes lignes) | **60 s** (`MIN_POLL_MS`) | Temps réel utile, retard possible |
+| Prochain départ > 7 min | `(δ × 60 − 120) s`, plafonné à **275 s** | Refresh 2 min avant le départ |
+| Erreur réseau | 275 s (`MAX_POLL_MS`) | Attente conservatrice |
+| Heure inconnue | 275 s | Pas encore synchronisé |
+| Nuit (00 h – 04 h 59) | Cycle sauté | Toutes lignes à l'arrêt |
+
+> Le seuil 7 min est défini par `URGENT_MIN`. Le délai d'anticipation de 2 min est
+> défini par `LEAD_TIME_S`.
+
+### Disjoncteur quotidien
+
+Un compteur `g_daily_req_count` est incrémenté à chaque appel `start_fetch()`.
+Lorsqu'il atteint **960** (`DAILY_REQ_LIMIT`), `compute_next_poll()` force
+immédiatement `MAX_POLL_MS = 275 s` pour le reste de la journée, désactivant le
+mode urgent. Le compteur est remis à zéro au passage de minuit, détecté d'après
+l'en-tête HTTP `Date:`.
+
+**Budget pire cas (tout en mode urgent 60 s) :**
+$$\frac{960\text{ req}}{4\text{ req/cycle}} \times 60\text{ s} = 14\,400\text{ s} = 4\text{ h de mode urgent maximum}$$
+
+**Budget normal (275 s constant, 19 h de service) :**
+$$\frac{19 \times 3600}{275} \times 4 = 992\text{ req/jour} < 1000 \checkmark$$
 
 ---
 
