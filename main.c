@@ -147,6 +147,7 @@ static bool     g_has_data     = false;
 static uint8_t  g_current_hour = 0xFF; /* 0xFF = heure inconnue (avant 1er fetch) */
 static uint8_t  g_current_min  = 0xFF;
 static uint8_t  g_prev_hour    = 0xFF; /* pour détecter le passage à minuit */
+static uint32_t g_time_ref_ms  = 0;   /* ms depuis boot quand g_current_hour/min a été mis à jour */
 static uint32_t g_next_poll_ms = MAX_POLL_MS; /* intervalle calculé dynamiquement */
 static uint16_t g_daily_req_count = 0; /* compteur de requêtes HTTPS depuis minuit */
 
@@ -354,6 +355,7 @@ static void update_time_from_hdr(void) {
     int local_min_abs = (h_utc + offset) * 60 + m_utc;
     g_current_hour = (uint8_t)((local_min_abs / 60) % 24);
     g_current_min  = (uint8_t)(local_min_abs % 60);
+    g_time_ref_ms  = to_ms_since_boot(get_absolute_time());
     DBG("Heure Paris: %02d:%02d (UTC%+d)\n", g_current_hour, g_current_min, offset);
 }
 
@@ -417,9 +419,20 @@ static void compute_next_poll(void) {
     g_next_poll_ms = next;
 }
 
+/* Estime l'heure Paris courante à partir du dernier horodatage HTTP + temps écoulé.
+   Indispensable pendant la pause nuit où aucune requête n'est faite. */
+static uint8_t estimated_hour(void) {
+    if (g_current_hour == 0xFF) return 0xFF;
+    uint32_t elapsed_ms = to_ms_since_boot(get_absolute_time()) - g_time_ref_ms;
+    int elapsed_min = (int)(elapsed_ms / 60000u);
+    int total_min = (int)g_current_hour * 60 + (int)g_current_min + elapsed_min;
+    return (uint8_t)((total_min / 60) % 24);
+}
+
 /* Retourne true si toutes les lignes sont à l'arrêt (00h00 – 04h59). */
 static bool is_night_hours(void) {
-    return g_current_hour != 0xFF && g_current_hour < HOUR_SERVICE_START;
+    uint8_t h = estimated_hour();
+    return h != 0xFF && h < HOUR_SERVICE_START;
 }
 
 
