@@ -7,7 +7,16 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(transilien_lcd main.c)
+# Sources TLS 1.3 + PSA absentes du pico_mbedtls par défaut
+set(MBEDTLS_LIB ${PICO_SDK_PATH}/lib/mbedtls/library)
+
+add_executable(transilien_lcd
+    main.c
+    ${MBEDTLS_LIB}/ssl_tls13_client.c
+    ${MBEDTLS_LIB}/ssl_tls13_generic.c
+    ${MBEDTLS_LIB}/psa_util.c
+    ${MBEDTLS_LIB}/psa_crypto_driver_wrappers_no_static.c
+)
 
 target_include_directories(transilien_lcd PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 

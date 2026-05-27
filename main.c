@@ -12,10 +12,11 @@
 #include "lwip/dns.h"
 #include "lwip/netif.h"
 #include "mbedtls/ssl.h"
+#include "psa/crypto.h"
 #include "secrets.h"
 
 /* ── Debug ───────────────────────────────────────────────────────────────── */
-// #define DEBUG   /* décommenter pour activer les traces UART */
+/* #define DEBUG */   /* décommenter pour activer les traces UART */
 #ifdef DEBUG
 #  define DBG(fmt, ...) printf(fmt, ##__VA_ARGS__)
 #else
@@ -803,6 +804,9 @@ int main(void) {
     ipaddr_aton("1.1.1.1", &dns_backup);
     dns_setserver(0, &dns_primary);
     dns_setserver(1, &dns_backup);
+
+    /* PSA crypto doit être initialisé avant tout handshake TLS 1.3 */
+    psa_crypto_init();
 
     /* Config TLS client : pas de vérification de certificat (pas de CA store embarqué).
        NULL/0 = skip cert verification, acceptable pour un device IoT sans cert store. */

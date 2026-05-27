@@ -6,7 +6,7 @@
 #define LWIP_NETCONN                0
 #define MEM_LIBC_MALLOC             0
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    32768  /* 32 KB — augmenté pour TLS */
+#define MEM_SIZE                    65536  /* 64 KB — requis pour TLS 1.3 (record 16KB + cert) */
 #define MEMP_NUM_TCP_SEG            32
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              24
@@ -14,7 +14,7 @@
 #define LWIP_ETHERNET               1
 #define LWIP_ICMP                   1
 #define LWIP_RAW                    1
-#define TCP_WND                     (8 * TCP_MSS)
+#define TCP_WND                     (14 * TCP_MSS)  /* >= 16384 pour TLS 1.3 max record */
 #define TCP_MSS                     1460
 #define TCP_SND_BUF                 (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
@@ -32,6 +32,7 @@
 #define LWIP_DHCP_DOES_ACD_CHECK    0
 #define SYS_LIGHTWEIGHT_PROT        1
 #define LWIP_DEBUG                  0
+#define ALTCP_MBEDTLS_DEBUG         LWIP_DBG_OFF
 #define LWIP_STATS                  0
 
 /* TLS via mbedTLS */

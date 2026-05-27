@@ -48,14 +48,36 @@
 #define MBEDTLS_X509_USE_C
 #define MBEDTLS_X509_CRT_PARSE_C
 
-/* TLS 1.2 client */
+/* TLS 1.2 + TLS 1.3 client */
 #define MBEDTLS_SSL_TLS_C
 #define MBEDTLS_SSL_CLI_C
 #define MBEDTLS_SSL_PROTO_TLS1_2
+#define MBEDTLS_SSL_PROTO_TLS1_3
+#define MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED
+#define MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE
+#define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
+#define MBEDTLS_HKDF_C
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
-#define MBEDTLS_SSL_SERVER_NAME_INDICATION   /* SNI */
+#define MBEDTLS_SSL_SERVER_NAME_INDICATION
+
+/* PSA Crypto — requis par TLS 1.3 */
+#define MBEDTLS_PSA_CRYPTO_C
+#define PSA_WANT_ALG_ECDH                    1
+#define PSA_WANT_ALG_HKDF                    1
+#define PSA_WANT_ALG_HKDF_EXTRACT            1
+#define PSA_WANT_ALG_HKDF_EXPAND             1
+#define PSA_WANT_ALG_SHA_256                 1
+#define PSA_WANT_ALG_SHA_384                 1
+#define PSA_WANT_ALG_ECDSA                   1
+#define PSA_WANT_KEY_TYPE_ECC_PUBLIC_KEY     1
+#define PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_BASIC 1
+#define PSA_WANT_ECC_SECP_R1_256             1
+#define PSA_WANT_ECC_SECP_R1_384             1
+/* Ciphers TLS 1.3 : TLS_AES_128_GCM_SHA256 + TLS_AES_256_GCM_SHA384 */
+#define PSA_WANT_ALG_GCM                     1
+#define PSA_WANT_KEY_TYPE_AES                1
 
 /* Entropie / DRBG */
 #define MBEDTLS_CTR_DRBG_C
