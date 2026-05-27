@@ -205,7 +205,7 @@ graph TD
 ```
 
 La réponse JSON pèse environ **60–80 Ko** par requête. Elle arrive en **chunked transfer
-encoding** sur une connexion HTTPS/TLS 1.2.
+encoding** sur une connexion HTTPS/TLS 1.3.
 
 ### Structure d'un objet `departure` dans la réponse
 
@@ -253,10 +253,10 @@ Une fois le firmware chargé, la pile TLS/lwIP monopolise une large part de la R
 
 | Zone | Taille |
 |------|--------|
-| Heap lwIP (`MEM_SIZE`) | 32 Ko |
-| Contexte mbedTLS + buffers TLS record | ~20–30 Ko |
+| Heap lwIP (`MEM_SIZE`) | 64 Ko |
+| Contexte mbedTLS + buffers TLS record | ~30–40 Ko |
 | Code `.bss` / `.data` / pile | ~20 Ko |
-| **Disponible pour l'application** | **~180 Ko** |
+| **Disponible pour l'application** | **~150 Ko** |
 
 Allouer un buffer statique de 80 Ko pour le JSON brut serait faisable mais consommerait
 presque la moitié de ce qui reste, sans aucun bénéfice puisque lwIP impose de toute
@@ -314,7 +314,7 @@ graph LR
 |-----------|--------|------|
 | `CTX_SIZE` | 12 288 o | Taille de la fenêtre de scan active |
 | `LOOKBACK_SIZE` | 8 192 o | Portion conservée lors du glissement |
-| `MEM_SIZE` (lwIP) | 32 768 o | Heap lwIP pour pbuf, TLS, TCP |
+| `MEM_SIZE` (lwIP) | 65 536 o | Heap lwIP pour pbuf, TLS, TCP (TLS 1.3 record 16 Ko) |
 
 ---
 
@@ -387,7 +387,7 @@ sequenceDiagram
     PICO->>DNS: Résolution prim.iledefrance-mobilites.fr
     DNS-->>PICO: IP résolue
 
-    PICO->>API: TCP connect + TLS 1.2 handshake (SNI)
+    PICO->>API: TCP connect + TLS 1.3 handshake (SNI)
     API-->>PICO: TLS établi
 
     PICO->>API: GET /stop_areas/63404/departures (temps réel V)
@@ -488,7 +488,7 @@ transilien_lcd/
 ├── main.c              Code principal (firmware Pico 2W)
 ├── CMakeLists.txt      Build system (pico-sdk, lwIP, mbedTLS)
 ├── lwipopts.h          Configuration lwIP (heap, TLS, TCP)
-├── mbedtls_config.h    Configuration mbedTLS (ciph., courbes, TLS 1.2)
+├── mbedtls_config.h    Configuration mbedTLS (ciph., courbes, TLS 1.3)
 ├── secrets.h           Credentials WiFi + clé API  ← ignoré par git
 ├── secrets.h.example   Template vide à copier
 ├── check_api.py        Script Python de validation des horaires
