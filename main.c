@@ -8,10 +8,9 @@
 #include "pico/cyw43_arch.h"
 #include "lwip/pbuf.h"
 #include "lwip/altcp.h"
-#include "lwip/altcp_tls.h"
+#include "lwip/altcp_tcp.h"
 #include "lwip/dns.h"
 #include "lwip/netif.h"
-#include "mbedtls/ssl.h"
 #include "secrets.h"
 
 /* ── Debug ───────────────────────────────────────────────────────────────── */
@@ -23,8 +22,8 @@
 #endif
 
 /* ── Configuration ────────────────────────────────────────────────────────── */
-#define PRIM_HOST        "prim.iledefrance-mobilites.fr"
-#define PRIM_PORT        443
+#define PRIM_HOST        "192.168.1.80"   /* proxy local Jetson → PRIM HTTPS */
+#define PRIM_PORT        8888
 #define NAVITIA_URI_V    "/marketplace/v2/navitia/stop_areas/" \
                          "stop_area%3AIDFM%3A63404/departures" \
                          "?count=40&duration=10800"
@@ -108,7 +107,6 @@ typedef enum {
 
 static volatile req_state_t     g_req_state = REQ_IDLE;
 static struct altcp_pcb        *g_pcb       = NULL;
-static struct altcp_tls_config *g_tls_cfg   = NULL;
 static uint32_t                 g_req_start_ms = 0;
 
 typedef enum {
@@ -116,10 +114,10 @@ typedef enum {
     REQERR_TIMEOUT,
     REQERR_DNS_NULL,
     REQERR_DNS_CALL,
-    REQERR_TLS_NEW,
+    REQERR_TCP_NEW,
     REQERR_CONNECT,
-    REQERR_TLS_CB,
-    REQERR_TLS_CONN,
+    REQERR_TCP_CB,
+    REQERR_TCP_CONN,
     REQERR_WRITE
 } req_err_t;
 
@@ -285,10 +283,10 @@ static const char *req_err_str(req_err_t e) {
         }
     case REQERR_DNS_NULL: return "DNS_NULL";
     case REQERR_DNS_CALL: return "DNS_CALL";
-    case REQERR_TLS_NEW: return "TLS_NEW";
+    case REQERR_TCP_NEW: return "TCP_NEW";
     case REQERR_CONNECT: return "CONNECT";
-    case REQERR_TLS_CB: return "TLS_CB";
-    case REQERR_TLS_CONN: return "TLS_CONN";
+    case REQERR_TCP_CB: return "TCP_CB";
+    case REQERR_TCP_CONN: return "TCP_CONN";
     case REQERR_WRITE: return "WRITE";
     case REQERR_NONE:
     default: return "NONE";
@@ -633,10 +631,10 @@ static void stream_reset(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Client HTTPS raw (altcp_tls)
+   Client HTTP raw (TCP plain → proxy local Jetson)
    ══════════════════════════════════════════════════════════════════════════ */
 
-static void tls_cleanup(void) {
+static void tcp_cleanup(void) {
     if (g_pcb) {
         altcp_recv(g_pcb, NULL);
         altcp_err(g_pcb, NULL);
@@ -645,18 +643,17 @@ static void tls_cleanup(void) {
     }
 }
 
-static void tls_err_cb(void *arg, err_t err) {
+static void tcp_err_cb(void *arg, err_t err) {
     (void)arg;
-    DBG("TLS erreur: %d\n", (int)err);
+    DBG("TCP erreur: %d\n", (int)err);
     g_pcb       = NULL;
-    g_req_err   = REQERR_TLS_CB;
+    g_req_err   = REQERR_TCP_CB;
     g_req_state = REQ_ERROR;
 }
 
-static err_t tls_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
+static err_t tcp_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
     (void)arg;
     if (!p) {
-        /* Serveur a fermé la connexion → réponse complète */
         altcp_close(pcb);
         g_pcb       = NULL;
         g_req_state = REQ_DONE;
@@ -680,42 +677,35 @@ static err_t tls_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t
     return ERR_OK;
 }
 
-static err_t tls_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
+static err_t tcp_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
     (void)arg;
-    if (err != ERR_OK) { g_req_err = REQERR_TLS_CONN; g_req_state = REQ_ERROR; return err; }
+    if (err != ERR_OK) { g_req_err = REQERR_TCP_CONN; g_req_state = REQ_ERROR; return err; }
 
     static char req[512];
     int n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: " PRIM_HOST "\r\n"
-        "apikey: %s\r\n"
         "Accept: application/json\r\n"
         "Connection: close\r\n"
         "\r\n",
-        g_req_path,
-        PRIM_API_KEY);
+        g_req_path);
 
     err_t e = altcp_write(pcb, req, (u16_t)n, TCP_WRITE_FLAG_COPY);
     if (e != ERR_OK) { g_req_err = REQERR_WRITE; g_req_state = REQ_ERROR; return ERR_OK; }
     altcp_output(pcb);
-    DBG("Requête HTTPS envoyée\n");
+    DBG("Requête HTTP envoyée\n");
     g_req_state = REQ_RECEIVING;
     return ERR_OK;
 }
 
 static void start_connect(const ip_addr_t *addr) {
-    g_pcb = altcp_tls_new(g_tls_cfg, IPADDR_TYPE_V4);
-    if (!g_pcb) { g_req_err = REQERR_TLS_NEW; g_req_state = REQ_ERROR; return; }
+    g_pcb = altcp_tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!g_pcb) { g_req_err = REQERR_TCP_NEW; g_req_state = REQ_ERROR; return; }
 
-    /* SNI obligatoire pour que le serveur présente le bon certificat */
-    mbedtls_ssl_set_hostname(
-        (mbedtls_ssl_context *)altcp_tls_context(g_pcb),
-        PRIM_HOST);
+    altcp_recv(g_pcb, tcp_recv_cb);
+    altcp_err(g_pcb, tcp_err_cb);
 
-    altcp_recv(g_pcb, tls_recv_cb);
-    altcp_err(g_pcb, tls_err_cb);
-
-    err_t e = altcp_connect(g_pcb, addr, PRIM_PORT, tls_connected_cb);
+    err_t e = altcp_connect(g_pcb, addr, PRIM_PORT, tcp_connected_cb);
     if (e != ERR_OK) {
         DBG("altcp_connect: %d\n", (int)e);
         altcp_close(g_pcb);
@@ -744,16 +734,11 @@ static void start_fetch(const char *path) {
     g_req_state = REQ_RESOLVING;
     g_req_start_ms = to_ms_since_boot(get_absolute_time());
 
+    /* Proxy local : IP fixe, pas de DNS nécessaire */
     static ip_addr_t server_ip;
-    err_t e = dns_gethostbyname(PRIM_HOST, &server_ip, dns_found_cb, NULL);
-    if (e == ERR_OK) {
-        /* Adresse en cache — connexion directe */
-        start_connect(&server_ip);
-    } else if (e != ERR_INPROGRESS) {
-        DBG("dns_gethostbyname: %d\n", (int)e);
-        g_req_err = REQERR_DNS_CALL;
-        g_req_state = REQ_ERROR;
-    }
+    ipaddr_aton(PRIM_HOST, &server_ip);
+    g_req_state = REQ_CONNECTING;
+    start_connect(&server_ip);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -803,10 +788,6 @@ int main(void) {
     ipaddr_aton("1.1.1.1", &dns_backup);
     dns_setserver(0, &dns_primary);
     dns_setserver(1, &dns_backup);
-
-    /* Config TLS client : pas de vérification de certificat (pas de CA store embarqué).
-       NULL/0 = skip cert verification, acceptable pour un device IoT sans cert store. */
-    g_tls_cfg = altcp_tls_create_config_client(NULL, 0);
 
     lcd_write_line(0, "Chargement...", 13);
     lcd_printf(1, "IP:%s", ip_str);
@@ -860,7 +841,7 @@ int main(void) {
         if (g_req_state == REQ_DONE) {
             g_req_state = REQ_IDLE;
             cyw43_arch_lwip_begin();
-            tls_cleanup();
+            tcp_cleanup();
             cyw43_arch_lwip_end();
 
             g_consecutive_errors = 0;
@@ -915,33 +896,27 @@ int main(void) {
         /* Erreur — réessayer après MAX_POLL_MS */
         if (g_req_state == REQ_ERROR) {
             DBG("Erreur requête — retry dans %lus\n", (unsigned long)(g_next_poll_ms/1000));
-            update_time_from_hdr(); /* peut être partiel mais tente quand même */
+            update_time_from_hdr();
             g_next_poll_ms = MAX_POLL_MS;
             g_req_state = REQ_IDLE;
             cyw43_arch_lwip_begin();
-            tls_cleanup();
+            tcp_cleanup();
             cyw43_arch_lwip_end();
             last_poll = to_ms_since_boot(get_absolute_time());
 
             g_consecutive_errors++;
             if (g_consecutive_errors >= 5) {
-                DBG("5 erreurs consecutives — reset TLS + reconnexion WiFi\n");
+                DBG("5 erreurs consecutives — reconnexion WiFi\n");
                 g_consecutive_errors = 0;
                 lcd_write_line(0, "Reconnexion WiFi...", 19);
                 lcd_write_line(1, "", 0);
-                /* Recréer la config TLS pour purger tout état mbedTLS corrompu */
-                if (g_tls_cfg) {
-                    altcp_tls_free_config(g_tls_cfg);
-                    g_tls_cfg = NULL;
-                }
                 cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
                     CYW43_AUTH_WPA2_MIXED_PSK, 30000);
-                g_tls_cfg = altcp_tls_create_config_client(NULL, 0);
                 last_poll = to_ms_since_boot(get_absolute_time());
             }
 
             if (!g_has_data) {
-                lcd_write_line(0, "Erreur API PRIM", 15);
+                lcd_write_line(0, "Erreur proxy PRIM", 17);
                 lcd_printf(1, "Retry %lus E:%s", (unsigned long)(MAX_POLL_MS/1000), req_err_str(g_req_err));
             }
         }
