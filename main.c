@@ -150,6 +150,7 @@ static uint8_t  g_prev_hour    = 0xFF; /* pour détecter le passage à minuit */
 static uint32_t g_time_ref_ms  = 0;   /* ms depuis boot quand g_current_hour/min a été mis à jour */
 static uint32_t g_next_poll_ms = MAX_POLL_MS; /* intervalle calculé dynamiquement */
 static uint16_t g_daily_req_count = 0; /* compteur de requêtes HTTPS depuis minuit */
+static uint8_t  g_consecutive_errors = 0; /* erreurs consécutives → déclencheur reconnexion */
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LCD driver
@@ -862,6 +863,7 @@ int main(void) {
             tls_cleanup();
             cyw43_arch_lwip_end();
 
+            g_consecutive_errors = 0;
             update_time_from_hdr();
             scan_ctx(true);
             g_has_data = true;
@@ -920,6 +922,24 @@ int main(void) {
             tls_cleanup();
             cyw43_arch_lwip_end();
             last_poll = to_ms_since_boot(get_absolute_time());
+
+            g_consecutive_errors++;
+            if (g_consecutive_errors >= 5) {
+                DBG("5 erreurs consecutives — reset TLS + reconnexion WiFi\n");
+                g_consecutive_errors = 0;
+                lcd_write_line(0, "Reconnexion WiFi...", 19);
+                lcd_write_line(1, "", 0);
+                /* Recréer la config TLS pour purger tout état mbedTLS corrompu */
+                if (g_tls_cfg) {
+                    altcp_tls_free_config(g_tls_cfg);
+                    g_tls_cfg = NULL;
+                }
+                cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
+                    CYW43_AUTH_WPA2_MIXED_PSK, 30000);
+                g_tls_cfg = altcp_tls_create_config_client(NULL, 0);
+                last_poll = to_ms_since_boot(get_absolute_time());
+            }
+
             if (!g_has_data) {
                 lcd_write_line(0, "Erreur API PRIM", 15);
                 lcd_printf(1, "Retry %lus E:%s", (unsigned long)(MAX_POLL_MS/1000), req_err_str(g_req_err));
